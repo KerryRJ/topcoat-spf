@@ -1,0 +1,19 @@
+# Topcoat UI install state. Managed by `topcoat ui`.
+version = 1
+components_dir = "src/components"
+
+[registries.topcoat.components.alert]
+hash = "sha256:e92db3e117e52149a1410956293c90544ac8679341427f8f27f6de95a90f73c6"
+file = 'src/components\alert.rs'
+
+[registries.topcoat.components.button]
+hash = "sha256:53bddb06a7db178a09d1e9395c1edb5e055b5f50107e8d4708ca029ecc1593af"
+file = 'src/components\button.rs'
+
+[registries.topcoat.components.spinner]
+hash = "sha256:b6f56c33a0fe596251eda25d24be84c463f6ec04a4ecefcbd70ec2fc20cfa38d"
+file = 'src/components\spinner.rs'
+
+[registries.topcoat.components.switch]
+hash = "sha256:226d9269f1d87bdf43cbddbcea450eb2a11944032dc307c656f8bf806a3d5932"
+file = 'src/components\switch.rs'

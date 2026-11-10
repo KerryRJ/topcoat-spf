@@ -1,0 +1,43 @@
+[package]
+name = "topcoat-spf"
+version = "0.1.0"
+edition = "2024"
+description = "Reusable SPF record inspection, rewriting and Topcoat UI"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["ui", "preview"]
+ui = ["dep:topcoat"]
+# Enabled by default so a plain `topcoat dev` can build the preview binary:
+# the CLI invokes `cargo build` without any feature flags. The preview uses
+# fixture DNS and address data and contacts no external services.
+preview = [
+    "ui",
+    "topcoat/router",
+    "topcoat/serve",
+    "dep:tokio",
+    "tokio/rt-multi-thread",
+    "tokio/time",
+]
+
+[dependencies]
+mail-auth = { version = "0.15", default-features = false, features = ["rust-crypto", "dns-hickory"] }
+thiserror = "2.0"
+topcoat = { version = "0.12", default-features = false, features = ["ui", "view", "icon-iconify", "tailwind"], optional = true }
+tokio = { version = "1.54", features = ["macros"], optional = true }
+
+[build-dependencies]
+topcoat = { version = "0.12", default-features = false, features = ["icon-iconify", "tailwind"] }
+
+[dev-dependencies]
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }
+
+[[bin]]
+name = "preview"
+path = "src/bin/preview.rs"
+required-features = ["preview"]
+
+[[example]]
+name = "preview"
+path = "examples/preview.rs"
+required-features = ["preview"]
