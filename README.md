@@ -51,6 +51,12 @@ and the proposal would remove the fixture's previously applied directive for
 that family. A timeout or inspection failure leaves Proposed unavailable with an
 error instead of presenting fixture data as a result.
 
+A simulated successful Publish redirects with `published=1`. In that state the
+fixture DNS record and last-applied addresses become the values Publish
+proposed, so the normal inspection reports Current and Proposed as equal,
+hides Proposed and disables Publish. Refresh, Enable and the provider switch
+preserve `published=1`; the initial fixture record returns only without it.
+
 The default enabled page returns its header, theme control, provider simulation
 and an accessible loading status immediately. It then fetches
 `/panel?enabled=…&provider=…` and replaces the loading region with the rendered
@@ -60,13 +66,15 @@ panel…". Inspection errors and timeouts remain visible in the inserted panel.
 Disabled settings render the panel immediately during the page request and skip
 inspection. If JavaScript is unavailable, or the fragment request fails,
 a fallback link (and `?full=1`) renders the panel during the page request; the
-full-page forms preserve `full`, `enabled` and `provider` so switching and
-refreshing keep working without JavaScript.
+full-page forms preserve `full`, `enabled`, `provider` and `published` so
+switching and refreshing keep working without JavaScript.
 
 Its Refresh control reloads the page and repeats the fixture inspection through
 the same loading shell, its Publish control POSTs to `/apply`, and its Enable
 switch POSTs to `/enable`; all handlers only redirect back without writing DNS,
-provider credentials or records. Publish is simulated and never calls `apply`. Starting
+provider credentials or records. Publish is simulated and never calls `apply`;
+a successful simulation redirects with `published=1` so the subsequent panel
+shows equal Current and Proposed records. Starting
 either action immediately shows its spinner and a visible, announced
 Refreshing… or Publishing… label, and repeat action submissions are ignored
 until the navigation completes. A preview-only switch POSTs to `/provider` to
@@ -374,7 +382,8 @@ The panel:
 * aligns public and last-published IPv4/IPv6 values under fixed labels;
 * aligns the Current and Proposed records as wrapping monospace text and shows
   the DNS record status beside the record name as In sync, Update available or
-  Unavailable;
+  Unavailable; Proposed is hidden when it matches Current, and shown when the
+  records differ or no proposal could be computed;
 * disables Refresh while SPF or the DNS provider is off, or a request is in
   flight;
 * disables Publish whenever SPF or the provider is off, the host's `Availability`

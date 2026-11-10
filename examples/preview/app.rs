@@ -8,12 +8,14 @@
 //! the independent SPF setting and `provider` selects the DNS provider state. A
 //! preview-only switch simulates the saved DNS provider setting: turning it off
 //! disables the SPF switch, Refresh and Publish, and turning it back on restores
-//! the independent SPF setting.
+//! the independent SPF setting. `published=1` records a simulated successful
+//! Publish, so the next snapshot reports Current and Proposed as equal.
 //!
 //! The page uses a fixture DNS source, fixture previous addresses and a fixture
 //! public-address source from the shared preview module, and builds the proposed
 //! record through the library's normal inspection and rewrite functions. Refresh
-//! reloads the page and rebuilds the snapshot from the fixtures.
+//! reloads the page and rebuilds the snapshot from the fixtures; while
+//! `published=1` is present it rebuilds the published fixture state instead.
 //!
 //! When the panel is loaded asynchronously, the initial response is a fast shell
 //! with the header, theme control, provider simulation and an accessible
@@ -183,6 +185,9 @@ struct PreviewQuery {
     /// `1` renders the panel during the page request instead of using the
     /// asynchronous loading shell. This is the no-JavaScript fallback.
     full: Option<String>,
+    /// `1` shows the fixture state after a simulated successful Publish: the
+    /// fixture DNS record and last-applied addresses hold the proposed values.
+    published: Option<String>,
 }
 
 fn preview_availability(spf_enabled: bool, provider_enabled: bool) -> Availability {
@@ -234,6 +239,7 @@ async fn panel_contents(
     snapshot: &Snapshot,
     spf_param: &str,
     provider_param: &str,
+    published: bool,
     full: bool,
 ) -> Result<ViewHandle> {
     let discovery_note =
@@ -258,6 +264,9 @@ async fn panel_contents(
             refresh_fields: Child::new(view! {
                 <input type="hidden" name="enabled" value=(spf_param)>
                 <input type="hidden" name="provider" value=(provider_param)>
+                if published {
+                    <input type="hidden" name="published" value="1">
+                }
                 if full {
                     <input type="hidden" name="full" value="1">
                 }
@@ -265,12 +274,18 @@ async fn panel_contents(
             apply_fields: Child::new(view! {
                 <input type="hidden" name="enabled" value=(spf_param)>
                 <input type="hidden" name="provider" value=(provider_param)>
+                if published {
+                    <input type="hidden" name="published" value="1">
+                }
                 if full {
                     <input type="hidden" name="full" value="1">
                 }
             }),
             enable_fields: Child::new(view! {
                 <input type="hidden" name="provider" value=(provider_param)>
+                if published {
+                    <input type="hidden" name="published" value="1">
+                }
                 if full {
                     <input type="hidden" name="full" value="1">
                 }
@@ -285,6 +300,7 @@ async fn panel_contents(
 async fn preview(cx: &Cx) -> Result<impl View> {
     let query = query_params::<PreviewQuery>(cx)?;
     let applied = query.notice.as_deref() == Some("applied");
+    let published = query.published.as_deref() == Some("1");
     let spf_enabled = query.enabled.as_deref() != Some("0");
     let provider_enabled = query.provider.as_deref() != Some("0");
     let spf_param = if spf_enabled { "1" } else { "0" };
@@ -296,14 +312,22 @@ async fn preview(cx: &Cx) -> Result<impl View> {
     // shell renders immediately and the browser loads the panel from `/panel`.
     let blocking = !availability.can_refresh() || query.full.as_deref() == Some("1");
     let contents = if blocking {
-        let snapshot = topcoat_spf::preview::snapshot(availability).await;
-        Some(panel_contents(cx, &snapshot, spf_param, provider_param, true).await?)
+        let snapshot = if published {
+            topcoat_spf::preview::published_snapshot(availability).await
+        } else {
+            topcoat_spf::preview::snapshot(availability).await
+        };
+        Some(panel_contents(cx, &snapshot, spf_param, provider_param, published, true).await?)
     } else {
         None
     };
-    let panel_src = format!("/panel?enabled={spf_param}&provider={provider_param}");
+    let panel_src = format!(
+        "/panel?enabled={spf_param}&provider={provider_param}{}",
+        if published { "&published=1" } else { "" }
+    );
     let fallback_src = format!(
-        "/?full=1&enabled={spf_param}&provider={provider_param}{}",
+        "/?full=1&enabled={spf_param}&provider={provider_param}{}{}",
+        if published { "&published=1" } else { "" },
         if applied { "&notice=applied" } else { "" }
     );
 
@@ -373,6 +397,9 @@ async fn preview(cx: &Cx) -> Result<impl View> {
                         </div>
                     </div>
                     <input type="hidden" name="enabled" value=(spf_param)>
+                    if published {
+                        <input type="hidden" name="published" value="1">
+                    }
                     if blocking {
                         <input type="hidden" name="full" value="1">
                     }
@@ -462,29 +489,37 @@ async fn panel_preview(cx: &Cx) -> Result<ViewHandle> {
     let query = query_params::<PreviewQuery>(cx)?;
     let spf_enabled = query.enabled.as_deref() != Some("0");
     let provider_enabled = query.provider.as_deref() != Some("0");
+    let published = query.published.as_deref() == Some("1");
     let availability = preview_availability(spf_enabled, provider_enabled);
-    let snapshot = topcoat_spf::preview::snapshot(availability).await;
+    let snapshot = if published {
+        topcoat_spf::preview::published_snapshot(availability).await
+    } else {
+        topcoat_spf::preview::snapshot(availability).await
+    };
     panel_contents(
         cx,
         &snapshot,
         if spf_enabled { "1" } else { "0" },
         if provider_enabled { "1" } else { "0" },
+        published,
         false,
     )
     .await
 }
 
-/// The Publish form posts here. The handler only redirects back to the page, so
-/// submitting the form cannot mutate anything. The resulting page load rebuilds
-/// the snapshot from the fixtures.
+/// The Publish form posts here. A successful simulated Publish redirects back
+/// with the published fixture state, so the next panel reports Current and
+/// Proposed as equal. Nothing is written to DNS.
 #[route(POST "/apply")]
 async fn apply_preview(cx: &Cx, Form(fields): Form<Vec<(String, String)>>) -> Result<SeeOther> {
     let spf_enabled = !contains(&fields, "enabled", "0");
     let provider_enabled = !contains(&fields, "provider", "0");
+    let published = preview_availability(spf_enabled, provider_enabled).can_write();
     Ok(redirect_to_preview(
         &fields,
         spf_enabled,
         provider_enabled,
+        published,
         true,
     ))
 }
@@ -503,6 +538,7 @@ async fn enable_preview(cx: &Cx, Form(fields): Form<Vec<(String, String)>>) -> R
         &fields,
         spf_enabled,
         provider_enabled,
+        contains(&fields, "published", "1"),
         false,
     ))
 }
@@ -520,6 +556,7 @@ async fn provider_preview(cx: &Cx, Form(fields): Form<Vec<(String, String)>>) ->
         &fields,
         spf_enabled,
         provider_enabled,
+        contains(&fields, "published", "1"),
         false,
     ))
 }
@@ -530,10 +567,11 @@ fn redirect_to_preview(
     fields: &[(String, String)],
     spf_enabled: bool,
     provider_enabled: bool,
+    published: bool,
     notice: bool,
 ) -> SeeOther {
     see_other(format!(
-        "/?enabled={}&provider={}{}{}",
+        "/?enabled={}&provider={}{}{}{}",
         if spf_enabled { "1" } else { "0" },
         if provider_enabled { "1" } else { "0" },
         if contains(fields, "full", "1") {
@@ -541,6 +579,7 @@ fn redirect_to_preview(
         } else {
             ""
         },
+        if published { "&published=1" } else { "" },
         if notice { "&notice=applied" } else { "" },
     ))
 }
@@ -616,6 +655,34 @@ mod tests {
         )
     }
 
+    async fn post(addr: SocketAddr, path: &str, form: &str) -> String {
+        let mut stream = TcpStream::connect(addr).await.expect("connect test server");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/html\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{form}",
+            form.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write test request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read test response");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn location(response: &str) -> &str {
+        response
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("location").then(|| value.trim())
+            })
+            .expect("response has a Location header")
+    }
+
     fn body(response: &str) -> &str {
         response
             .split_once("\r\n\r\n")
@@ -653,6 +720,64 @@ mod tests {
         assert!(
             !body.contains("data-spf-panel=\"\""),
             "the shell must not pretend the panel finished rendering"
+        );
+    }
+
+    #[tokio::test]
+    async fn simulated_publish_makes_current_and_proposed_equal() {
+        let (addr, server) = start_server().await;
+
+        let applied = tokio::time::timeout(
+            Duration::from_secs(5),
+            post(addr, "/apply", "enabled=1&provider=1"),
+        )
+        .await
+        .expect("publish response is bounded");
+        assert!(applied.starts_with("HTTP/1.1 303"), "{applied}");
+        let location = location(&applied);
+        assert!(location.contains("published=1"), "{location}");
+        assert!(location.contains("notice=applied"), "{location}");
+
+        let (shell, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            get(addr, "/?enabled=1&provider=1&published=1"),
+        )
+        .await
+        .expect("published page is bounded");
+        let shell_body = body(&shell);
+        let panel_src = shell_body
+            .split_once("data-spf-panel-src=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(src, _)| src)
+            .expect("the loading shell points at the panel fragment");
+        assert!(panel_src.contains("enabled=1"), "{panel_src}");
+        assert!(panel_src.contains("provider=1"), "{panel_src}");
+        assert!(panel_src.contains("published=1"), "{panel_src}");
+
+        let (panel, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            get(addr, "/panel?enabled=1&provider=1&published=1"),
+        )
+        .await
+        .expect("published panel is bounded");
+        server.abort();
+
+        assert!(panel.starts_with("HTTP/1.1 200"), "{panel}");
+        let panel_body = body(&panel);
+        assert!(panel_body.contains("data-spf-panel=\"\""));
+        assert!(
+            panel_body
+                .contains("v=spf1 ip4:203.0.113.24 ip6:2001:db8::24 include:_spf.example.net -all"),
+            "{panel_body}"
+        );
+        assert!(panel_body.contains("In sync"), "{panel_body}");
+        assert!(
+            !panel_body.contains(">Proposed"),
+            "Proposed must be hidden after publishing: {panel_body}"
+        );
+        assert!(
+            !panel_body.contains("id=\"desired-record\""),
+            "{panel_body}"
         );
     }
 

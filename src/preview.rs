@@ -10,6 +10,9 @@
 //! inspection is bounded by [`DISCOVERY_TIMEOUT`]. [`Snapshot::public_ipv4`] and
 //! [`Snapshot::public_ipv6`] contain the fixture public addresses. The preview's
 //! Publish action is simulated in the example app; this module never writes DNS.
+//! [`published_snapshot`] simulates the state after that Publish succeeds: the
+//! fixture DNS record and last-applied addresses hold the proposed values, so
+//! inspection reports Current and Proposed as equal.
 
 use crate::{
     Availability, DiscoveredAddresses, FixedWritePolicy, InspectRequest, MemorySpfAddressStore,
@@ -23,7 +26,8 @@ pub const DOMAIN: &str = "example.com";
 /// The label shown as the snapshot source.
 pub const SOURCE: &str = "Preview fixture (static DNS record)";
 
-/// The one SPF TXT value the fixture DNS source returns.
+/// The one SPF TXT value the fixture DNS source returns before a simulated
+/// Publish.
 pub const CURRENT_RECORD: &str = "v=spf1 ip4:198.51.100.24 include:_spf.example.net -all";
 
 /// Overall budget for the preview's fixture inspection.
@@ -41,15 +45,36 @@ pub fn applied() -> SpfAddresses {
     }
 }
 
+/// Which fixture state the preview should present.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PreviewState {
+    /// The fixture DNS record has not been published by the preview.
+    #[default]
+    Unpublished,
+    /// A successful Publish is simulated: the fixture DNS record and
+    /// last-applied addresses hold the values Publish proposed.
+    Published,
+}
+
 /// Read-only fixture DNS source.
-#[derive(Clone, Copy, Debug, Default)]
-struct FixtureDns;
+#[derive(Clone, Debug)]
+struct FixtureDns {
+    current: String,
+}
+
+impl FixtureDns {
+    fn for_state(state: PreviewState) -> Self {
+        Self {
+            current: current_record(state),
+        }
+    }
+}
 
 impl SpfDns for FixtureDns {
     type Error = Infallible;
 
     async fn txt_records(&self, _name: &crate::DomainName) -> Result<Vec<String>, Self::Error> {
-        Ok(vec![CURRENT_RECORD.to_owned()])
+        Ok(vec![self.current.clone()])
     }
 
     async fn replace_txt_records(
@@ -74,10 +99,14 @@ impl PublicAddressDiscovery for FixtureDiscovery {
     type Error = Infallible;
 
     async fn discover(&self) -> Result<DiscoveredAddresses, Self::Error> {
-        Ok(DiscoveredAddresses {
-            ipv4: Some("203.0.113.24".parse().expect("documentation IPv4")),
-            ipv6: Some("2001:db8::24".parse().expect("documentation IPv6")),
-        })
+        Ok(fixture_discovered())
+    }
+}
+
+fn fixture_discovered() -> DiscoveredAddresses {
+    DiscoveredAddresses {
+        ipv4: Some("203.0.113.24".parse().expect("documentation IPv4")),
+        ipv6: Some("2001:db8::24".parse().expect("documentation IPv6")),
     }
 }
 
@@ -89,20 +118,41 @@ impl PublicAddressDiscovery for FixtureDiscovery {
 /// value. A timeout or an inspection failure also leaves the proposed value
 /// empty rather than presenting a fixture-only rewrite as an update.
 pub async fn snapshot(availability: Availability) -> Snapshot {
-    snapshot_with(&FixtureDiscovery, availability, DISCOVERY_TIMEOUT).await
+    snapshot_for(availability, PreviewState::Unpublished).await
 }
 
-async fn snapshot_with<D>(discovery: &D, availability: Availability, timeout: Duration) -> Snapshot
+/// Build the preview snapshot after simulating a successful Publish.
+///
+/// The fixture DNS record and last-applied addresses are the values Publish
+/// proposed. Running the normal [`inspect`] rewrite against them therefore
+/// reports Current and Proposed as equal and clears [`Snapshot::needs_update`],
+/// so the panel hides Proposed and disables Publish.
+pub async fn published_snapshot(availability: Availability) -> Snapshot {
+    snapshot_for(availability, PreviewState::Published).await
+}
+
+async fn snapshot_for(availability: Availability, state: PreviewState) -> Snapshot {
+    snapshot_with(&FixtureDiscovery, availability, DISCOVERY_TIMEOUT, state).await
+}
+
+async fn snapshot_with<D>(
+    discovery: &D,
+    availability: Availability,
+    timeout: Duration,
+    state: PreviewState,
+) -> Snapshot
 where
     D: PublicAddressDiscovery,
 {
     if !availability.can_refresh() {
-        return fixture_snapshot(availability, None);
+        return fixture_snapshot(availability, None, state);
     }
 
-    let dns = FixtureDns;
-    let store =
-        MemorySpfAddressStore::with_initial([(crate::DomainName::new(DOMAIN).unwrap(), applied())]);
+    let dns = FixtureDns::for_state(state);
+    let store = MemorySpfAddressStore::with_initial([(
+        crate::DomainName::new(DOMAIN).unwrap(),
+        applied_for_state(state),
+    )]);
     let policy = FixedWritePolicy::new(availability.clone());
     let request = InspectRequest::new(crate::DomainName::new(DOMAIN).unwrap(), SOURCE);
     let inspection = inspect(&dns, discovery, &store, &policy, &request);
@@ -123,6 +173,7 @@ where
             Some(format!(
                 "Fixture inspection did not finish within {timeout:?}. The static DNS fixture is shown and no public IP addresses were produced."
             )),
+            state,
         ),
     }
 }
@@ -162,19 +213,53 @@ pub fn discovery_note(snapshot: &Snapshot) -> Option<String> {
 /// Disabled snapshots keep the fixture readable but leave the proposed value
 /// empty because inspection was intentionally skipped. A timeout also has no
 /// proposal because no inspection completed.
-fn fixture_snapshot(availability: Availability, error: Option<String>) -> Snapshot {
+fn fixture_snapshot(
+    availability: Availability,
+    error: Option<String>,
+    state: PreviewState,
+) -> Snapshot {
     Snapshot {
         domain: crate::DomainName::new(DOMAIN).unwrap(),
         source: SOURCE.into(),
-        current: Some(CURRENT_RECORD.into()),
+        current: Some(current_record(state)),
         desired: None,
         public_ipv4: None,
         public_ipv6: None,
-        applied: applied(),
+        applied: applied_for_state(state),
         availability,
         matches: false,
         needs_update: false,
         error,
+    }
+}
+
+/// The fixture DNS value for a state.
+fn current_record(state: PreviewState) -> String {
+    match state {
+        PreviewState::Unpublished => CURRENT_RECORD.to_owned(),
+        PreviewState::Published => published_record(),
+    }
+}
+
+/// The fixture record Publish proposes, used as the DNS value after publishing.
+fn published_record() -> String {
+    let discovered = fixture_discovered();
+    crate::desired_spf_record(
+        Some(CURRENT_RECORD),
+        discovered.ipv4,
+        discovered.ipv6,
+        &applied(),
+    )
+    .expect("the fixture record can be rewritten")
+    .into_string()
+}
+
+/// The last-applied addresses for a state. A simulated Publish saves the
+/// addresses it published, clearing a family discovery did not provide.
+fn applied_for_state(state: PreviewState) -> SpfAddresses {
+    match state {
+        PreviewState::Unpublished => applied(),
+        PreviewState::Published => applied().replaced_with(fixture_discovered()),
     }
 }
 
@@ -261,7 +346,13 @@ mod tests {
     }
 
     async fn inspect_with(discovery: &impl PublicAddressDiscovery) -> Snapshot {
-        snapshot_with(discovery, Availability::available(), Duration::from_secs(1)).await
+        snapshot_with(
+            discovery,
+            Availability::available(),
+            Duration::from_secs(1),
+            PreviewState::Unpublished,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -298,6 +389,22 @@ mod tests {
         assert!(!snapshot.matches);
         assert!(snapshot.error.is_none());
         assert!(discovery_note(&snapshot).is_none());
+    }
+
+    #[tokio::test]
+    async fn published_snapshot_reports_current_and_proposed_equal() {
+        let snapshot = published_snapshot(Availability::available()).await;
+        let published = "v=spf1 ip4:203.0.113.24 ip6:2001:db8::24 include:_spf.example.net -all";
+
+        assert_eq!(snapshot.current.as_deref(), Some(published));
+        assert_eq!(snapshot.desired.as_deref(), Some(published));
+        assert!(!snapshot.needs_update);
+        assert!(snapshot.matches);
+        assert_eq!(
+            snapshot.applied,
+            applied().replaced_with(fixture_discovered())
+        );
+        assert!(snapshot.error.is_none());
     }
 
     #[tokio::test]
@@ -394,6 +501,7 @@ mod tests {
             &PendingDiscovery,
             Availability::available(),
             Duration::from_millis(10),
+            PreviewState::Unpublished,
         )
         .await;
 
@@ -422,6 +530,7 @@ mod tests {
             &discovery,
             Availability::spf_disabled("SPF is disabled."),
             Duration::from_secs(1),
+            PreviewState::Unpublished,
         )
         .await;
 
@@ -443,6 +552,7 @@ mod tests {
             &discovery,
             Availability::provider_disabled(true, "The DNS provider is disabled."),
             Duration::from_secs(1),
+            PreviewState::Unpublished,
         )
         .await;
 

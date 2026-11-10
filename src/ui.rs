@@ -144,6 +144,10 @@ pub async fn spf_panel(
         .unwrap_or("SPF updates are unavailable. Enable and configure the DNS provider.");
     let apply_disabled = apply_is_disabled(snapshot, busy);
     let refresh_disabled = refresh_is_disabled(snapshot, busy);
+    // The Proposed value is only meaningful when it differs from Current. Reuse
+    // the same comparison that gates Publish, requiring a computed proposal so
+    // an unavailable one is still shown.
+    let proposal_in_sync = snapshot.desired.is_some() && !snapshot.needs_update;
     let spf_enabled = snapshot.availability.spf_enabled;
     let provider_enabled = snapshot.availability.provider_enabled;
     let switch_disabled = busy || !provider_enabled;
@@ -276,15 +280,17 @@ pub async fn spf_panel(
                             (current)
                         </dd>
                     </div>
-                    <div class="grid grid-cols-1 gap-1 sm:grid-cols-[5.5rem_minmax(0,1fr)] sm:items-baseline sm:gap-x-4">
-                        <dt class="text-muted-foreground">"Proposed"</dt>
-                        <dd
-                            id="desired-record"
-                            class="min-w-0 font-mono break-words whitespace-pre-wrap"
-                        >
-                            (snapshot.desired.as_deref().unwrap_or("No proposal available."))
-                        </dd>
-                    </div>
+                    if !proposal_in_sync {
+                        <div class="grid grid-cols-1 gap-1 sm:grid-cols-[5.5rem_minmax(0,1fr)] sm:items-baseline sm:gap-x-4">
+                            <dt class="text-muted-foreground">"Proposed"</dt>
+                            <dd
+                                id="desired-record"
+                                class="min-w-0 font-mono break-words whitespace-pre-wrap"
+                            >
+                                (snapshot.desired.as_deref().unwrap_or("No proposal available."))
+                            </dd>
+                        </div>
+                    }
                 </dl>
             </section>
 
@@ -689,6 +695,32 @@ mod tests {
         assert!(tag(&html, "id=\"refresh-dns\"").contains("sm:w-auto"));
         assert!(tag(&html, "id=\"refresh-dns\"").contains("sm:min-w-40"));
         assert!(tag(&html, "id=\"update-spf\"").contains("sm:min-w-40"));
+    }
+
+    #[tokio::test]
+    async fn proposed_record_is_hidden_only_when_it_matches_current() {
+        let mut in_sync = snapshot();
+        in_sync.desired = Some(crate::SpfRecordText::new("v=spf1 -all").unwrap());
+        in_sync.needs_update = false;
+        in_sync.matches = true;
+        let html = render_panel(&in_sync).await;
+        assert!(html.contains(">Current"));
+        assert!(html.contains("v=spf1 -all"));
+        assert!(!html.contains(">Proposed"));
+        assert!(!html.contains("id=\"desired-record\""));
+
+        // An uncomputed proposal is not in sync, so it stays visible.
+        let mut unavailable = snapshot();
+        unavailable.desired = None;
+        unavailable.needs_update = false;
+        let html = render_panel(&unavailable).await;
+        assert!(html.contains(">Proposed"));
+        assert!(html.contains("No proposal available."));
+
+        // A differing proposal stays visible.
+        let html = render_panel(&snapshot()).await;
+        assert!(html.contains(">Proposed"));
+        assert!(html.contains("v=spf1 ip4:203.0.113.8 -all"));
     }
 
     #[tokio::test]
