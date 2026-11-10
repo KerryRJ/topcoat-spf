@@ -31,10 +31,11 @@ const PUBLISH: IconData = iconify_icon!("lucide:cloud-upload");
 /// Include it once on pages that render [`spf_panel`]. It submits the switch
 /// form on change and immediately disables the panel's controls while the
 /// switch is off. When a Refresh or Publish form starts a native submission, it
-/// immediately shows the action's spinner and accessible busy label, and it
-/// ignores further panel submissions until navigation completes. Form fields
-/// are never disabled, so the submitted form data and method are preserved. A
-/// bfcache restore (`pageshow`) clears a stale progress state.
+/// immediately shows the action's spinner and accessible busy label, dims the
+/// other action, and ignores further panel submissions until navigation
+/// completes. Form fields are never disabled, so the submitted form data and
+/// method are preserved. A bfcache restore (`pageshow`) clears a stale progress
+/// state.
 ///
 /// Panels inserted after the initial page render work through the same event
 /// delegation. Dispatch an `spf:panel-loaded` event on `document` after the new
@@ -243,10 +244,16 @@ pub async fn spf_panel(
             </section>
 
             <section class="flex flex-col gap-2" aria-labelledby="spf-dns-record-heading">
-                <div class="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-                    <h3 id="spf-dns-record-heading" class="text-sm font-semibold">
-                        "DNS record"
-                    </h3>
+                <h3 id="spf-dns-record-heading" class="text-sm font-semibold">
+                    "DNS record"
+                </h3>
+                <p class="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                    <span>
+                        "Record name "
+                        <span id="spf-record-name" class="font-mono break-all text-foreground">
+                            (snapshot.domain.as_str())
+                        </span>
+                    </span>
                     <span
                         id="record-match-status"
                         class=(class!(
@@ -257,12 +264,6 @@ pub async fn spf_panel(
                     >
                         <span class="size-1.5 rounded-full bg-current" aria-hidden="true"></span>
                         (status_label)
-                    </span>
-                </div>
-                <p class="text-xs text-muted-foreground">
-                    "Record name "
-                    <span id="spf-record-name" class="font-mono break-all text-foreground">
-                        (snapshot.domain.as_str())
                     </span>
                 </p>
                 <dl class="spf-records-table flex flex-col gap-3 text-sm">
@@ -299,11 +300,11 @@ pub async fn spf_panel(
                     >
                         (refresh_fields)
                         button(
-                            variant: ButtonVariant::Ghost,
+                            variant: ButtonVariant::Outline,
                             attrs: attributes! {
                                 id="refresh-dns"
                                 type="submit"
-                                class="w-full justify-center sm:w-auto"
+                                class="w-full justify-center sm:w-auto sm:min-w-40 aria-disabled:pointer-events-none aria-disabled:opacity-50"
                                 disabled=(refresh_disabled)
                                 data-spf-action="refresh"
                                 data-spf-idle-label="Refresh"
@@ -338,7 +339,7 @@ pub async fn spf_panel(
                             attrs: attributes! {
                                 id="update-spf"
                                 type="submit"
-                                class="w-full justify-center sm:w-auto"
+                                class="w-full justify-center sm:w-auto sm:min-w-40 aria-disabled:pointer-events-none aria-disabled:opacity-50"
                                 disabled=(apply_disabled)
                                 title="Publish current public addresses. Removes previously applied addresses for unavailable families; preserves other SPF mechanisms and TXT records."
                                 data-spf-action="publish"
@@ -598,6 +599,8 @@ mod tests {
         assert!(refresh.contains("data-spf-icon"));
         assert!(refresh.contains("data-spf-label"));
         assert!(refresh.contains(">Refresh</span>"));
+        assert!(has_class(refresh, "aria-disabled:pointer-events-none"));
+        assert!(has_class(refresh, "aria-disabled:opacity-50"));
         assert!(has_class(tag(refresh, "data-spf-spinner"), "hidden"));
         assert!(!has_class(tag(refresh, "data-spf-icon"), "hidden"));
 
@@ -612,8 +615,24 @@ mod tests {
             "title=\"Publish current public addresses. Removes previously applied addresses for unavailable families; preserves other SPF mechanisms and TXT records.\""
         ));
         assert!(!html.contains("Publishing replaces the previously applied addresses"));
+        assert!(has_class(publish, "aria-disabled:pointer-events-none"));
+        assert!(has_class(publish, "aria-disabled:opacity-50"));
         assert!(has_class(tag(publish, "data-spf-spinner"), "hidden"));
         assert!(!has_class(tag(publish, "data-spf-icon"), "hidden"));
+    }
+
+    #[tokio::test]
+    async fn actions_use_matching_widths_and_variants_not_a_layout_shift() {
+        let html = render_panel(&snapshot()).await;
+        let refresh = button(&html, "refresh-dns");
+        let publish = button(&html, "update-spf");
+
+        assert!(has_class(refresh, "border-border"));
+        assert!(has_class(publish, "bg-foreground/5"));
+        assert!(has_class(refresh, "sm:min-w-40"));
+        assert!(has_class(publish, "sm:min-w-40"));
+        assert!(has_class(refresh, "w-full"));
+        assert!(has_class(publish, "w-full"));
     }
 
     #[test]
@@ -622,6 +641,7 @@ mod tests {
         assert!(SPF_PANEL_JS.contains("preventDefault"));
         assert!(SPF_PANEL_JS.contains("pageshow"));
         assert!(SPF_PANEL_JS.contains("aria-busy"));
+        assert!(SPF_PANEL_JS.contains("control.removeAttribute(\"aria-disabled\")"));
         assert!(SPF_PANEL_JS.contains("spf:panel-loaded"));
     }
 
@@ -667,6 +687,8 @@ mod tests {
         assert!(current.contains("break-words"));
         assert!(desired.contains("break-words"));
         assert!(tag(&html, "id=\"refresh-dns\"").contains("sm:w-auto"));
+        assert!(tag(&html, "id=\"refresh-dns\"").contains("sm:min-w-40"));
+        assert!(tag(&html, "id=\"update-spf\"").contains("sm:min-w-40"));
     }
 
     #[tokio::test]

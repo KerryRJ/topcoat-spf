@@ -358,9 +358,10 @@ submits the same form.
 `SPF_PANEL_JS` also adds the progress behavior. When Refresh or Publish starts a
 native form submission, the submitting button immediately shows the installed
 spinner, swaps its label to Refreshing… or Publishing…, and updates a polite
-`role="status"` region for assistive technology. The other action and the Enable
-switch are marked `aria-disabled`, and further panel submissions are ignored
-while that navigation is in flight. No form field is disabled and the form's
+`role="status"` region for assistive technology. The other action is marked
+`aria-disabled` and dimmed to match its disabled appearance, the Enable switch is
+marked `aria-disabled`, and further panel submissions are ignored while that
+navigation is in flight. No form field is disabled and the form's
 action, method and values are left unchanged, so the submitted data is
 preserved. A `pageshow`
 listener clears a stale progress state when the browser restores the page from
@@ -372,8 +373,8 @@ The panel:
   the master control, followed by public address and DNS record sections;
 * aligns public and last-published IPv4/IPv6 values under fixed labels;
 * aligns the Current and Proposed records as wrapping monospace text and shows
-  the DNS record status beside the section heading as In sync, Update available
-  or Unavailable;
+  the DNS record status beside the record name as In sync, Update available or
+  Unavailable;
 * disables Refresh while SPF or the DNS provider is off, or a request is in
   flight;
 * disables Publish whenever SPF or the provider is off, the host's `Availability`
@@ -387,15 +388,17 @@ The panel:
   `busy` state is action-agnostic, so `SPF_PANEL_JS` adds the action-specific
   Refreshing…/Publishing… label when a form actually submits;
 * shows a visible spinner and busy label immediately on Refresh or Publish
-  submit, announces the state through a polite status region, avoids repeated
-  panel submissions, and never disables the fields being submitted;
+  submit, dims the other action, announces the state through a polite status
+  region, avoids repeated panel submissions, and never disables the fields
+  being submitted;
 * leaves the displayed information readable when disabled and shows the hint
   "Enable to refresh or publish" while SPF is off; when the provider is off it
   shows the availability reason instead;
 * groups Refresh and Publish at the bottom left on wider screens and stacks
-  them on narrow screens; Refresh uses the quiet Ghost variant and Publish uses
-  the theme-relative Secondary variant, which fits both light and dark host
-  themes;
+  them on narrow screens; Refresh uses the quiet Outline variant and Publish
+  uses the theme-relative Secondary variant, which fits both light and dark
+  host themes; both actions share a minimum width on wider screens so the
+  longer Refreshing…/Publishing… label cannot shift the row;
 * explains Publish through a native `title` tooltip on the button instead of a
   separate paragraph: it publishes the current public addresses, removes
   previously applied addresses for unavailable families, and preserves other

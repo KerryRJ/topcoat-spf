@@ -27,9 +27,14 @@
     panel.setAttribute("aria-busy", "true");
 
     for (const control of panel.querySelectorAll("[data-spf-action]")) {
-      // Announce the in-flight action without disabling any form field. The
-      // submitting form still carries every field when it navigates.
-      control.setAttribute("aria-disabled", "true");
+      // Dim the other action without disabling any form field. The submitting
+      // form still carries every field when it navigates, and its spinner stays
+      // at full contrast.
+      if (control === button) {
+        control.removeAttribute("aria-disabled");
+      } else {
+        control.setAttribute("aria-disabled", "true");
+      }
       control
         .querySelector("[data-spf-icon]")
         ?.classList.toggle("hidden", control === button);
