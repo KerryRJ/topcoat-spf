@@ -65,7 +65,7 @@ fn refresh_is_disabled(snapshot: &Snapshot, busy: bool) -> bool {
 /// and still need a rewrite to remove a stale managed address.
 pub fn apply_is_disabled(snapshot: &Snapshot, busy: bool) -> bool {
     busy || !snapshot.availability.can_write()
-        || snapshot.desired.is_empty()
+        || snapshot.desired.is_none()
         || !snapshot.needs_update
 }
 
@@ -152,7 +152,7 @@ pub async fn spf_panel(
         "Current SPF record is missing one or more public IP addresses"
     };
     let (status_label, status_class) =
-        if !snapshot.availability.can_write() || snapshot.desired.is_empty() {
+        if !snapshot.availability.can_write() || snapshot.desired.is_none() {
             ("Unavailable", "text-muted-foreground")
         } else if snapshot.needs_update {
             ("Update available", "text-foreground")
@@ -262,7 +262,7 @@ pub async fn spf_panel(
                 <p class="text-xs text-muted-foreground">
                     "Record name "
                     <span id="spf-record-name" class="font-mono break-all text-foreground">
-                        (snapshot.domain.clone())
+                        (snapshot.domain.as_str())
                     </span>
                 </p>
                 <dl class="spf-records-table flex flex-col gap-3 text-sm">
@@ -281,7 +281,7 @@ pub async fn spf_panel(
                             id="desired-record"
                             class="min-w-0 font-mono break-words whitespace-pre-wrap"
                         >
-                            (snapshot.desired.clone())
+                            (snapshot.desired.as_deref().unwrap_or("No proposal available."))
                         </dd>
                     </div>
                 </dl>
@@ -391,13 +391,17 @@ mod tests {
 
     fn snapshot() -> Snapshot {
         Snapshot {
-            domain: "example.com".into(),
+            domain: crate::DomainName::new("example.com").unwrap(),
             source: "DNS provider".into(),
             current: Some("v=spf1 -all".into()),
-            desired: "v=spf1 ip4:203.0.113.8 -all".into(),
+            desired: Some(crate::SpfRecordText::new("v=spf1 ip4:203.0.113.8 -all").unwrap()),
             availability: Availability::available(),
             needs_update: true,
-            ..Snapshot::default()
+            public_ipv4: None,
+            public_ipv6: None,
+            applied: Default::default(),
+            matches: false,
+            error: None,
         }
     }
 
@@ -426,7 +430,7 @@ mod tests {
         assert!(apply_is_disabled(&up_to_date, false));
 
         let mut uncomputed = pending;
-        uncomputed.desired.clear();
+        uncomputed.desired = None;
         assert!(apply_is_disabled(&uncomputed, false));
     }
 

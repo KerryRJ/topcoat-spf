@@ -11,10 +11,16 @@ use crate::{
     SpfError,
     spf::{
         desired_spf_record, is_public_ipv4, is_public_ipv6, is_spf,
-        record_matches_public_addresses, records_equivalent, replace_txt_records,
+        record_matches_public_addresses, records_equivalent, replace_txt_records_checked,
     },
 };
-use std::{collections::HashMap, convert::Infallible, fmt::Display, future::Future, sync::Mutex};
+use std::{fmt::Display, future::Future};
+
+mod fixed_write_policy;
+mod memory_spf_address_store;
+
+pub use fixed_write_policy::FixedWritePolicy;
+pub use memory_spf_address_store::MemorySpfAddressStore;
 
 /// Narrow asynchronous TXT capability required by the SPF service.
 ///
@@ -30,7 +36,7 @@ pub trait SpfDns: Send + Sync {
     /// Return every TXT value at `name`, or an empty vector when none exist.
     fn txt_records(
         &self,
-        name: &str,
+        name: &crate::DomainName,
     ) -> impl Future<Output = Result<Vec<String>, Self::Error>> + Send;
 
     /// Replace the complete TXT RRset at `name` with `records`.
@@ -40,7 +46,7 @@ pub trait SpfDns: Send + Sync {
     /// leave the RRset temporarily changed; see the crate README.
     fn replace_txt_records(
         &self,
-        name: &str,
+        name: &crate::DomainName,
         records: &[String],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
@@ -62,13 +68,16 @@ pub trait SpfAddressStore: Send + Sync {
 
     /// Return the last successfully published addresses for `domain`, or an
     /// empty value when none have been stored.
-    fn load(&self, domain: &str) -> impl Future<Output = Result<SpfAddresses, Self::Error>> + Send;
+    fn load(
+        &self,
+        domain: &crate::DomainName,
+    ) -> impl Future<Output = Result<SpfAddresses, Self::Error>> + Send;
 
     /// Persist `addresses` as the latest successfully published values for
     /// `domain`.
     fn save(
         &self,
-        domain: &str,
+        domain: &crate::DomainName,
         addresses: &SpfAddresses,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
@@ -99,87 +108,6 @@ pub trait PublicAddressDiscovery: Send + Sync {
     fn discover(&self) -> impl Future<Output = Result<DiscoveredAddresses, Self::Error>> + Send;
 }
 
-/// An explicit guarded policy for hosts that already checked their settings.
-///
-/// The service still calls `check` before writing, but this value is a fixed
-/// snapshot. Prefer a settings-backed [`WritePolicy`] for long-lived servers.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FixedWritePolicy {
-    pub availability: Availability,
-}
-
-impl FixedWritePolicy {
-    pub fn new(availability: Availability) -> Self {
-        Self { availability }
-    }
-
-    pub fn available() -> Self {
-        Self::new(Availability::available())
-    }
-
-    pub fn disabled(reason: impl Into<String>) -> Self {
-        Self::new(Availability::disabled(reason))
-    }
-}
-
-impl WritePolicy for FixedWritePolicy {
-    type Error = Infallible;
-
-    async fn check(&self) -> Result<Availability, Self::Error> {
-        Ok(self.availability.clone())
-    }
-}
-
-/// A reusable in-memory last-published-address store for examples, previews
-/// and tests.
-///
-/// Values are process-local and are discarded when the store is dropped.
-#[derive(Default)]
-pub struct MemorySpfAddressStore {
-    values: Mutex<HashMap<String, SpfAddresses>>,
-}
-
-impl MemorySpfAddressStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_initial(values: impl IntoIterator<Item = (String, SpfAddresses)>) -> Self {
-        Self {
-            values: Mutex::new(values.into_iter().collect()),
-        }
-    }
-
-    pub fn snapshot(&self) -> HashMap<String, SpfAddresses> {
-        self.values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
-    }
-}
-
-impl SpfAddressStore for MemorySpfAddressStore {
-    type Error = Infallible;
-
-    async fn load(&self, domain: &str) -> Result<SpfAddresses, Self::Error> {
-        Ok(self
-            .values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(domain)
-            .copied()
-            .unwrap_or_default())
-    }
-
-    async fn save(&self, domain: &str, addresses: &SpfAddresses) -> Result<(), Self::Error> {
-        self.values
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(domain.to_owned(), *addresses);
-        Ok(())
-    }
-}
-
 /// Inspect the current record and build the desired one without writing.
 ///
 /// This is intentionally resilient: discovery, storage, policy and DNS errors
@@ -187,7 +115,7 @@ impl SpfAddressStore for MemorySpfAddressStore {
 /// known. The desired value uses only the usable discovered families: a family
 /// that discovery did not provide is not carried over from the stored applied
 /// addresses, so its previously managed directive is removed from the proposal.
-/// When neither family is usable, [`Snapshot::desired`] is empty and no rewrite
+/// When neither family is usable, [`Snapshot::desired`] is `None` and no rewrite
 /// is proposed. The host should re-check its own authorization before exposing
 /// the snapshot, and must not treat a snapshot as permission to write.
 pub async fn inspect<D, A, S, P>(
@@ -203,7 +131,7 @@ where
     S: SpfAddressStore,
     P: WritePolicy,
 {
-    let domain = request.domain.trim();
+    let domain = &request.domain;
     let mut error = None;
     let availability = match policy.check().await {
         Ok(availability) => availability,
@@ -235,47 +163,47 @@ where
     };
 
     let mut current = None;
-    if domain.is_empty() {
-        append_error(&mut error, "Set a domain before inspecting SPF.");
-    } else {
-        match dns.txt_records(domain).await {
-            Ok(records) => {
-                let spf: Vec<_> = records
-                    .into_iter()
-                    .filter(|record| is_spf(record))
-                    .collect();
-                current = spf.first().cloned();
-                if spf.len() > 1 {
-                    append_error(
-                        &mut error,
-                        "Multiple SPF TXT records were returned; SPF requires a single record.",
-                    );
-                }
+    let mut multiple_spf = false;
+    match dns.txt_records(domain).await {
+        Ok(records) => {
+            let spf: Vec<_> = records
+                .into_iter()
+                .filter(|record| is_spf(record))
+                .collect();
+            current = spf.first().cloned();
+            if spf.len() > 1 {
+                multiple_spf = true;
+                append_error(
+                    &mut error,
+                    "Multiple SPF TXT records were returned; SPF requires a single record.",
+                );
             }
-            Err(dns_error) => {
-                append_error(&mut error, format!("DNS TXT lookup failed: {dns_error}"));
-            }
+        }
+        Err(dns_error) => {
+            append_error(&mut error, format!("DNS TXT lookup failed: {dns_error}"));
         }
     }
 
     let next = applied.replaced_with(discovered);
-    let desired = if next.is_empty() {
-        // With no usable family, an update must not remove every managed
-        // directive. `apply` refuses the same state with NoDiscoveredAddress.
-        String::new()
+    let desired = if multiple_spf || next.is_empty() {
+        // Multiple records cannot be safely rewritten. With no usable family,
+        // an update must not remove every managed directive either.
+        None
     } else {
-        desired_spf_record(current.as_deref(), next.ipv4, next.ipv6, &applied).unwrap_or_else(
-            |record_error| {
+        desired_spf_record(current.as_deref(), next.ipv4, next.ipv6, &applied)
+            .map(Some)
+            .unwrap_or_else(|record_error| {
                 append_error(&mut error, record_error.to_string());
-                String::new()
-            },
-        )
+                None
+            })
     };
     let matches =
         record_matches_public_addresses(current.as_deref(), discovered.ipv4, discovered.ipv6);
     // `apply` compares the complete TXT RRset, but unrelated values are preserved
     // by construction, so the SPF value alone determines whether it writes.
-    let needs_update = !desired.is_empty() && current.as_deref() != Some(desired.as_str());
+    let needs_update = desired
+        .as_ref()
+        .is_some_and(|value| current.as_deref() != Some(value.as_str()));
 
     Snapshot {
         domain: domain.to_owned(),
@@ -307,7 +235,7 @@ pub async fn apply<D, S, A, P>(
     store: &S,
     discovery: &A,
     policy: &P,
-    domain: &str,
+    domain: &crate::DomainName,
 ) -> Result<ApplyResult, SpfError>
 where
     D: SpfDns,
@@ -321,11 +249,6 @@ where
             .await
             .map_err(|error| SpfError::Policy(error.to_string()))?,
     )?;
-    let domain = domain.trim();
-    if domain.is_empty() {
-        return Err(SpfError::NoDomain);
-    }
-
     let discovered = public_discovered(
         discovery
             .discover()
@@ -345,7 +268,8 @@ where
         .txt_records(domain)
         .await
         .map_err(|error| SpfError::Lookup(error.to_string()))?;
-    let rewrite = replace_txt_records(&original, next.ipv4, next.ipv6, &applied)?;
+    let addresses = crate::UsablePublicAddresses::try_from(discovered)?;
+    let rewrite = replace_txt_records_checked(&original, addresses, &applied)?;
     let changed = !records_equivalent(&original, &rewrite.records);
 
     if changed {
@@ -430,7 +354,10 @@ fn append_error(error: &mut Option<String>, message: impl Into<String>) {
 mod tests {
     use super::*;
     use crate::spf::is_spf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[derive(Clone, Copy)]
     enum ReplaceBehavior {
@@ -494,18 +421,18 @@ mod tests {
     impl SpfDns for FakeDns {
         type Error = String;
 
-        async fn txt_records(&self, name: &str) -> Result<Vec<String>, Self::Error> {
+        async fn txt_records(&self, name: &crate::DomainName) -> Result<Vec<String>, Self::Error> {
             self.lists.fetch_add(1, Ordering::SeqCst);
             self.names
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .push(name.to_owned());
+                .push(name.to_string());
             Ok(self.records())
         }
 
         async fn replace_txt_records(
             &self,
-            _name: &str,
+            _name: &crate::DomainName,
             records: &[String],
         ) -> Result<(), Self::Error> {
             self.writes.fetch_add(1, Ordering::SeqCst);
@@ -566,11 +493,15 @@ mod tests {
     impl SpfAddressStore for FailingStore {
         type Error = String;
 
-        async fn load(&self, _domain: &str) -> Result<SpfAddresses, Self::Error> {
+        async fn load(&self, _domain: &crate::DomainName) -> Result<SpfAddresses, Self::Error> {
             Ok(SpfAddresses::default())
         }
 
-        async fn save(&self, _domain: &str, _addresses: &SpfAddresses) -> Result<(), Self::Error> {
+        async fn save(
+            &self,
+            _domain: &crate::DomainName,
+            _addresses: &SpfAddresses,
+        ) -> Result<(), Self::Error> {
             Err("storage offline".into())
         }
     }
@@ -583,7 +514,10 @@ mod tests {
     }
 
     fn request() -> InspectRequest {
-        InspectRequest::new("example.com", "Test provider")
+        InspectRequest::new(
+            crate::DomainName::new("example.com").unwrap(),
+            "Test provider",
+        )
     }
 
     #[tokio::test]
@@ -596,15 +530,15 @@ mod tests {
         let store = MemorySpfAddressStore::new();
         let policy = CountingPolicy::new(1);
         let snapshot = inspect(&dns, &discovery, &store, &policy, &request()).await;
-        assert_eq!(snapshot.domain, "example.com");
+        assert_eq!(snapshot.domain.as_str(), "example.com");
         assert_eq!(snapshot.source, "Test provider");
         assert_eq!(
             snapshot.current.as_deref(),
             Some("v=spf1 ip4:8.8.8.7 include:example.com ~all")
         );
         assert_eq!(
-            snapshot.desired,
-            "v=spf1 ip4:8.8.8.7 include:example.com ~all"
+            snapshot.desired.as_deref(),
+            Some("v=spf1 ip4:8.8.8.7 include:example.com ~all")
         );
         assert!(snapshot.matches);
         assert!(!snapshot.needs_update);
@@ -686,7 +620,7 @@ mod tests {
     async fn inspect_treats_non_public_discovered_addresses_as_unavailable() {
         let dns = FakeDns::new(&["v=spf1 ip4:8.8.8.7 -all"]);
         let store = MemorySpfAddressStore::with_initial([(
-            "example.com".to_string(),
+            crate::DomainName::new("example.com").unwrap(),
             SpfAddresses {
                 ipv4: Some("8.8.8.7".parse().unwrap()),
                 ipv6: None,
@@ -706,7 +640,10 @@ mod tests {
         .await;
         assert_eq!(snapshot.public_ipv4, None);
         assert_eq!(snapshot.public_ipv6, Some("2001:db8::8".parse().unwrap()));
-        assert_eq!(snapshot.desired, "v=spf1 ip6:2001:db8::8 -all");
+        assert_eq!(
+            snapshot.desired.as_deref(),
+            Some("v=spf1 ip6:2001:db8::8 -all")
+        );
         assert!(snapshot.error.is_none());
     }
 
@@ -717,7 +654,7 @@ mod tests {
             "v=spf1 ip4:8.8.8.7 ip6:2001:db8::7 include:example.com -all",
         ]);
         let store = MemorySpfAddressStore::with_initial([(
-            "example.com".to_string(),
+            crate::DomainName::new("example.com").unwrap(),
             SpfAddresses {
                 ipv4: Some("8.8.8.7".parse().unwrap()),
                 ipv6: Some("2001:db8::7".parse().unwrap()),
@@ -736,8 +673,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            snapshot.desired,
-            "v=spf1 ip4:9.9.9.9 include:example.com -all"
+            snapshot.desired.as_deref(),
+            Some("v=spf1 ip4:9.9.9.9 include:example.com -all")
         );
         assert!(snapshot.needs_update);
         assert!(snapshot.error.is_none());
@@ -747,11 +684,11 @@ mod tests {
             &store,
             &discovery,
             &CountingPolicy::new(2),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap();
-        assert_eq!(result.desired_record, snapshot.desired);
+        assert_eq!(Some(result.desired_record), snapshot.desired);
         assert_eq!(
             dns.records(),
             vec![
@@ -766,7 +703,12 @@ mod tests {
                 ipv6: None,
             }
         );
-        assert_eq!(store.snapshot().get("example.com"), Some(&result.applied));
+        assert_eq!(
+            store
+                .snapshot()
+                .get(&crate::DomainName::new("example.com").unwrap()),
+            Some(&result.applied)
+        );
     }
 
     #[tokio::test]
@@ -774,7 +716,7 @@ mod tests {
         let dns =
             FakeDns::new(&["v=spf1 ip4:203.0.113.7 ip6:2001:db8::7 include:example.com -all"]);
         let store = MemorySpfAddressStore::with_initial([(
-            "example.com".to_string(),
+            crate::DomainName::new("example.com").unwrap(),
             SpfAddresses {
                 ipv4: Some("203.0.113.7".parse().unwrap()),
                 ipv6: Some("2001:db8::7".parse().unwrap()),
@@ -789,7 +731,7 @@ mod tests {
             &store,
             &discovery,
             &CountingPolicy::new(2),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap();
@@ -804,7 +746,12 @@ mod tests {
             dns.records(),
             vec!["v=spf1 ip4:203.0.113.8 include:example.com -all".to_string()]
         );
-        assert_eq!(store.snapshot().get("example.com"), Some(&result.applied));
+        assert_eq!(
+            store
+                .snapshot()
+                .get(&crate::DomainName::new("example.com").unwrap()),
+            Some(&result.applied)
+        );
     }
 
     #[tokio::test]
@@ -812,7 +759,7 @@ mod tests {
         let dns =
             FakeDns::new(&["v=spf1 ip4:203.0.113.7 ip6:2001:db8::7 include:example.com -all"]);
         let store = MemorySpfAddressStore::with_initial([(
-            "example.com".to_string(),
+            crate::DomainName::new("example.com").unwrap(),
             SpfAddresses {
                 ipv4: Some("203.0.113.7".parse().unwrap()),
                 ipv6: Some("2001:db8::7".parse().unwrap()),
@@ -827,7 +774,7 @@ mod tests {
             &store,
             &discovery,
             &CountingPolicy::new(2),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap();
@@ -842,7 +789,12 @@ mod tests {
             dns.records(),
             vec!["v=spf1 ip6:2001:db8::8 include:example.com -all".to_string()]
         );
-        assert_eq!(store.snapshot().get("example.com"), Some(&result.applied));
+        assert_eq!(
+            store
+                .snapshot()
+                .get(&crate::DomainName::new("example.com").unwrap()),
+            Some(&result.applied)
+        );
     }
 
     #[tokio::test]
@@ -852,7 +804,10 @@ mod tests {
             ipv4: Some("203.0.113.7".parse().unwrap()),
             ipv6: Some("2001:db8::7".parse().unwrap()),
         };
-        let store = MemorySpfAddressStore::with_initial([("example.com".to_string(), applied)]);
+        let store = MemorySpfAddressStore::with_initial([(
+            crate::DomainName::new("example.com").unwrap(),
+            applied,
+        )]);
         let discovery = FakeDiscovery(DiscoveredAddresses::default());
 
         let snapshot = inspect(
@@ -863,7 +818,7 @@ mod tests {
             &request(),
         )
         .await;
-        assert!(snapshot.desired.is_empty());
+        assert!(snapshot.desired.is_none());
         assert!(!snapshot.needs_update);
         assert_eq!(snapshot.applied, applied);
         assert!(snapshot.error.is_none());
@@ -873,7 +828,7 @@ mod tests {
             &store,
             &discovery,
             &CountingPolicy::new(1),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap_err();
@@ -882,14 +837,19 @@ mod tests {
         // another read or a write before refusing.
         assert_eq!(dns.list_count(), 1);
         assert_eq!(dns.write_count(), 0);
-        assert_eq!(store.snapshot().get("example.com"), Some(&applied));
+        assert_eq!(
+            store
+                .snapshot()
+                .get(&crate::DomainName::new("example.com").unwrap()),
+            Some(&applied)
+        );
     }
 
     #[tokio::test]
     async fn inspect_requires_an_update_when_a_stale_managed_address_remains() {
         let dns = FakeDns::new(&["v=spf1 ip4:8.8.8.7 ip4:9.9.9.9 -all"]);
         let store = MemorySpfAddressStore::with_initial([(
-            "example.com".to_string(),
+            crate::DomainName::new("example.com").unwrap(),
             SpfAddresses {
                 ipv4: Some("8.8.8.7".parse().unwrap()),
                 ipv6: None,
@@ -913,14 +873,14 @@ mod tests {
             snapshot.current.as_deref(),
             Some("v=spf1 ip4:8.8.8.7 ip4:9.9.9.9 -all")
         );
-        assert_eq!(snapshot.desired, "v=spf1 ip4:9.9.9.9 -all");
+        assert_eq!(snapshot.desired.as_deref(), Some("v=spf1 ip4:9.9.9.9 -all"));
     }
 
     #[tokio::test]
     async fn apply_removes_a_stale_managed_address_that_still_matches_coverage() {
         let dns = FakeDns::new(&["v=spf1 ip4:8.8.8.7 ip4:9.9.9.9 -all"]);
         let store = MemorySpfAddressStore::with_initial([(
-            "example.com".to_string(),
+            crate::DomainName::new("example.com").unwrap(),
             SpfAddresses {
                 ipv4: Some("8.8.8.7".parse().unwrap()),
                 ipv6: None,
@@ -935,7 +895,7 @@ mod tests {
             &store,
             &discovery,
             &CountingPolicy::new(2),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap();
@@ -946,17 +906,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspect_trims_the_domain_like_apply() {
+    async fn inspect_uses_the_canonical_domain_at_dns_boundary() {
         let dns = FakeDns::new(&["v=spf1 -all"]);
         let snapshot = inspect(
             &dns,
             &public_discovery(),
             &MemorySpfAddressStore::new(),
             &CountingPolicy::new(1),
-            &InspectRequest::new("  example.com  ", "Test provider"),
+            &InspectRequest::new(
+                crate::DomainName::new("  ExAmPlE.COM.  ").unwrap(),
+                "Test provider",
+            ),
         )
         .await;
-        assert_eq!(snapshot.domain, "example.com");
+        assert_eq!(snapshot.domain.as_str(), "example.com");
         assert_eq!(dns.queried_names(), vec!["example.com".to_string()]);
         assert!(snapshot.needs_update);
     }
@@ -966,9 +929,15 @@ mod tests {
         let dns = FakeDns::new(&["verification=keep", "v=spf1 include:example.com -all"]);
         let store = MemorySpfAddressStore::new();
         let policy = CountingPolicy::new(2);
-        let result = apply(&dns, &store, &public_discovery(), &policy, "example.com")
-            .await
-            .unwrap();
+        let result = apply(
+            &dns,
+            &store,
+            &public_discovery(),
+            &policy,
+            &crate::DomainName::new("example.com").unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(result.changed);
         assert_eq!(
             result.desired_record,
@@ -981,7 +950,12 @@ mod tests {
                 "v=spf1 ip4:203.0.113.8 ip6:2001:db8::8 include:example.com -all".to_string()
             ]
         );
-        assert_eq!(store.snapshot().get("example.com"), Some(&result.applied));
+        assert_eq!(
+            store
+                .snapshot()
+                .get(&crate::DomainName::new("example.com").unwrap()),
+            Some(&result.applied)
+        );
         assert_eq!(dns.list_count(), 2);
         assert_eq!(dns.write_count(), 1);
         assert_eq!(policy.checks(), 2);
@@ -991,7 +965,7 @@ mod tests {
     async fn apply_removes_a_private_family_and_clears_its_saved_address() {
         let dns = FakeDns::new(&["v=spf1 ip4:8.8.8.7 -all"]);
         let store = MemorySpfAddressStore::with_initial([(
-            "example.com".to_string(),
+            crate::DomainName::new("example.com").unwrap(),
             SpfAddresses {
                 ipv4: Some("8.8.8.7".parse().unwrap()),
                 ipv6: None,
@@ -1006,7 +980,7 @@ mod tests {
             &store,
             &discovery,
             &CountingPolicy::new(2),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap();
@@ -1023,7 +997,12 @@ mod tests {
                 .iter()
                 .any(|record| record.contains("8.8.8.7"))
         );
-        assert_eq!(store.snapshot().get("example.com"), Some(&result.applied));
+        assert_eq!(
+            store
+                .snapshot()
+                .get(&crate::DomainName::new("example.com").unwrap()),
+            Some(&result.applied)
+        );
     }
 
     #[tokio::test]
@@ -1039,7 +1018,7 @@ mod tests {
             &store,
             &discovery,
             &CountingPolicy::new(1),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap_err();
@@ -1062,7 +1041,7 @@ mod tests {
             &store,
             &discovery,
             &CountingPolicy::new(1),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap();
@@ -1080,7 +1059,7 @@ mod tests {
             &MemorySpfAddressStore::new(),
             &public_discovery(),
             &CountingPolicy::new(0),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap_err();
@@ -1098,7 +1077,7 @@ mod tests {
             &MemorySpfAddressStore::new(),
             &public_discovery(),
             &policy,
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap_err();
@@ -1121,7 +1100,7 @@ mod tests {
             &MemorySpfAddressStore::new(),
             &public_discovery(),
             &policy,
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap_err();
@@ -1146,7 +1125,7 @@ mod tests {
             &MemorySpfAddressStore::new(),
             &public_discovery(),
             &policy,
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap_err();
@@ -1167,9 +1146,15 @@ mod tests {
             write_available: true,
             reason: None,
         });
-        let result = apply(&dns, &store, &public_discovery(), &policy, "example.com")
-            .await
-            .unwrap();
+        let result = apply(
+            &dns,
+            &store,
+            &public_discovery(),
+            &policy,
+            &crate::DomainName::new("example.com").unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(result.changed);
         assert_eq!(dns.write_count(), 1);
     }
@@ -1204,9 +1189,15 @@ mod tests {
         let dns = FakeDns::new(&["v=spf1 include:example.com -all"]);
         let store = MemorySpfAddressStore::new();
         let policy = CountingPolicy::new(1);
-        let error = apply(&dns, &store, &public_discovery(), &policy, "example.com")
-            .await
-            .unwrap_err();
+        let error = apply(
+            &dns,
+            &store,
+            &public_discovery(),
+            &policy,
+            &crate::DomainName::new("example.com").unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, SpfError::WriteUnavailable(_)));
         assert_eq!(policy.checks(), 2);
         assert_eq!(dns.list_count(), 1);
@@ -1226,7 +1217,7 @@ mod tests {
             &store,
             &public_discovery(),
             &CountingPolicy::new(2),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap_err();
@@ -1243,7 +1234,7 @@ mod tests {
             &FailingStore,
             &public_discovery(),
             &CountingPolicy::new(2),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap_err();
@@ -1260,7 +1251,7 @@ mod tests {
             &MemorySpfAddressStore::new(),
             &public_discovery(),
             &CountingPolicy::new(2),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap_err();
@@ -1273,7 +1264,7 @@ mod tests {
             &MemorySpfAddressStore::new(),
             &FakeDiscovery(DiscoveredAddresses::default()),
             &CountingPolicy::new(1),
-            "example.com",
+            &crate::DomainName::new("example.com").unwrap(),
         )
         .await
         .unwrap_err();
@@ -1281,19 +1272,8 @@ mod tests {
         assert_eq!(dns.list_count(), 0);
     }
 
-    #[tokio::test]
-    async fn apply_requires_a_domain() {
-        let dns = FakeDns::new(&[]);
-        let error = apply(
-            &dns,
-            &MemorySpfAddressStore::new(),
-            &public_discovery(),
-            &CountingPolicy::new(1),
-            "   ",
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, SpfError::NoDomain));
-        assert_eq!(dns.list_count(), 0);
+    #[test]
+    fn domain_requires_a_name() {
+        assert!(crate::DomainName::new("   ").is_err());
     }
 }

@@ -48,13 +48,13 @@ struct FixtureDns;
 impl SpfDns for FixtureDns {
     type Error = Infallible;
 
-    async fn txt_records(&self, _name: &str) -> Result<Vec<String>, Self::Error> {
+    async fn txt_records(&self, _name: &crate::DomainName) -> Result<Vec<String>, Self::Error> {
         Ok(vec![CURRENT_RECORD.to_owned()])
     }
 
     async fn replace_txt_records(
         &self,
-        _name: &str,
+        _name: &crate::DomainName,
         _records: &[String],
     ) -> Result<(), Self::Error> {
         // `inspect` only reads. The preview's Publish handler never calls
@@ -101,9 +101,10 @@ where
     }
 
     let dns = FixtureDns;
-    let store = MemorySpfAddressStore::with_initial([(DOMAIN.to_owned(), applied())]);
+    let store =
+        MemorySpfAddressStore::with_initial([(crate::DomainName::new(DOMAIN).unwrap(), applied())]);
     let policy = FixedWritePolicy::new(availability.clone());
-    let request = InspectRequest::new(DOMAIN, SOURCE);
+    let request = InspectRequest::new(crate::DomainName::new(DOMAIN).unwrap(), SOURCE);
     let inspection = inspect(&dns, discovery, &store, &policy, &request);
 
     match tokio::time::timeout(timeout, inspection).await {
@@ -111,7 +112,7 @@ where
             if snapshot.public_ipv4.is_none() && snapshot.public_ipv6.is_none() {
                 // No fixture address is usable. Keep the previous fixture
                 // addresses visible in "last applied"; no update is proposed.
-                snapshot.desired.clear();
+                snapshot.desired = None;
                 snapshot.matches = false;
                 snapshot.needs_update = false;
             }
@@ -163,10 +164,10 @@ pub fn discovery_note(snapshot: &Snapshot) -> Option<String> {
 /// proposal because no inspection completed.
 fn fixture_snapshot(availability: Availability, error: Option<String>) -> Snapshot {
     Snapshot {
-        domain: DOMAIN.into(),
+        domain: crate::DomainName::new(DOMAIN).unwrap(),
         source: SOURCE.into(),
         current: Some(CURRENT_RECORD.into()),
-        desired: String::new(),
+        desired: None,
         public_ipv4: None,
         public_ipv6: None,
         applied: applied(),
@@ -270,8 +271,8 @@ mod tests {
         assert_eq!(snapshot.public_ipv4, Some(ipv4("203.0.113.24")));
         assert_eq!(snapshot.public_ipv6, Some(ipv6("2001:db8::24")));
         assert_eq!(
-            snapshot.desired,
-            "v=spf1 ip4:203.0.113.24 ip6:2001:db8::24 include:_spf.example.net -all"
+            snapshot.desired.as_deref(),
+            Some("v=spf1 ip4:203.0.113.24 ip6:2001:db8::24 include:_spf.example.net -all")
         );
         assert!(snapshot.needs_update);
         assert!(snapshot.error.is_none());
@@ -290,8 +291,8 @@ mod tests {
         assert_eq!(snapshot.public_ipv6, Some(ipv6("2001:db8::24")));
         assert_eq!(snapshot.applied, applied());
         assert_eq!(
-            snapshot.desired,
-            "v=spf1 ip4:203.0.113.24 ip6:2001:db8::24 include:_spf.example.net -all"
+            snapshot.desired.as_deref(),
+            Some("v=spf1 ip4:203.0.113.24 ip6:2001:db8::24 include:_spf.example.net -all")
         );
         assert!(snapshot.needs_update);
         assert!(!snapshot.matches);
@@ -310,8 +311,8 @@ mod tests {
         assert_eq!(snapshot.public_ipv4, Some(ipv4("203.0.113.24")));
         assert_eq!(snapshot.public_ipv6, None);
         assert_eq!(
-            snapshot.desired,
-            "v=spf1 ip4:203.0.113.24 include:_spf.example.net -all"
+            snapshot.desired.as_deref(),
+            Some("v=spf1 ip4:203.0.113.24 include:_spf.example.net -all")
         );
         assert!(
             discovery_note(&snapshot)
@@ -329,8 +330,8 @@ mod tests {
         assert_eq!(snapshot.public_ipv6, Some(ipv6("2001:db8::24")));
         // The missing family removes the fixture's last-applied IPv4 directive.
         assert_eq!(
-            snapshot.desired,
-            "v=spf1 ip6:2001:db8::24 include:_spf.example.net -all"
+            snapshot.desired.as_deref(),
+            Some("v=spf1 ip6:2001:db8::24 include:_spf.example.net -all")
         );
         assert!(
             discovery_note(&snapshot)
@@ -349,7 +350,7 @@ mod tests {
 
         assert_eq!(snapshot.public_ipv4, Some(ipv4("198.51.100.24")));
         assert_eq!(snapshot.public_ipv6, None);
-        assert_eq!(snapshot.desired, CURRENT_RECORD);
+        assert_eq!(snapshot.desired.as_deref(), Some(CURRENT_RECORD));
         assert!(!snapshot.needs_update);
         assert!(snapshot.matches);
         assert!(snapshot.error.is_none());
@@ -357,7 +358,7 @@ mod tests {
         let snapshot = inspect_with(&FixedDiscovery(discovered(None, None))).await;
         assert_eq!(snapshot.public_ipv4, None);
         assert_eq!(snapshot.public_ipv6, None);
-        assert!(snapshot.desired.is_empty());
+        assert!(snapshot.desired.is_none());
         assert!(!snapshot.needs_update);
         assert!(!snapshot.matches);
         assert!(snapshot.error.is_none());
@@ -376,7 +377,7 @@ mod tests {
         assert_eq!(snapshot.applied, applied());
         assert_eq!(snapshot.public_ipv4, None);
         assert_eq!(snapshot.public_ipv6, None);
-        assert!(snapshot.desired.is_empty());
+        assert!(snapshot.desired.is_none());
         assert!(!snapshot.needs_update);
         assert!(
             snapshot
@@ -400,7 +401,7 @@ mod tests {
         assert_eq!(snapshot.applied, applied());
         assert_eq!(snapshot.public_ipv4, None);
         assert_eq!(snapshot.public_ipv6, None);
-        assert!(snapshot.desired.is_empty());
+        assert!(snapshot.desired.is_none());
         assert!(!snapshot.needs_update);
         assert!(
             snapshot
@@ -429,7 +430,7 @@ mod tests {
         assert_eq!(snapshot.applied, applied());
         assert_eq!(snapshot.public_ipv4, None);
         assert_eq!(snapshot.public_ipv6, None);
-        assert!(snapshot.desired.is_empty());
+        assert!(snapshot.desired.is_none());
         assert!(snapshot.error.is_none());
         assert!(
             discovery_note(&snapshot)
@@ -448,7 +449,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(snapshot.availability.spf_enabled);
         assert!(!snapshot.availability.provider_enabled);
-        assert!(snapshot.desired.is_empty());
+        assert!(snapshot.desired.is_none());
         assert!(snapshot.error.is_none());
     }
 }

@@ -27,8 +27,9 @@
 //! `README.md` for integration and atomicity limits.
 //!
 //! ```text
+//! let domain = DomainName::new("example.com")?;
 //! let snapshot = inspect(&dns, &discovery, &store, &policy, &request).await;
-//! let result = apply(&dns, &store, &discovery, &policy, "example.com").await?;
+//! let result = apply(&dns, &store, &discovery, &policy, &domain).await?;
 //! ```
 //!
 //! The public traits return `Send` futures so the service is usable from
@@ -41,15 +42,17 @@ mod spf;
 
 pub use error::SpfError;
 pub use model::{
-    ApplyResult, Availability, DiscoveredAddresses, InspectRequest, Snapshot, SpfAddresses,
+    ApplyResult, Availability, DiscoveredAddresses, DomainName, DomainNameError, InspectRequest,
+    Snapshot, SpfAddresses, SpfRecordText, UsablePublicAddresses,
 };
 pub use service::{
     FixedWritePolicy, MemorySpfAddressStore, PublicAddressDiscovery, SpfAddressStore, SpfDns,
     WritePolicy, apply, inspect,
 };
 pub use spf::{
-    Rewrite, desired_spf_record, is_public_ipv4, is_public_ipv6, is_spf, record_includes_ip,
-    record_matches_public_addresses, records_equivalent, replace_txt_records,
+    Rewrite, desired_spf_record, desired_spf_record_checked, is_public_ipv4, is_public_ipv6,
+    is_spf, record_includes_ip, record_matches_public_addresses, records_equivalent,
+    replace_txt_records, replace_txt_records_checked,
 };
 
 #[cfg(feature = "ui")]

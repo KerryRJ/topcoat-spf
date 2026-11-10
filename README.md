@@ -48,7 +48,7 @@ page load and Refresh builds the Proposed record and status through the normal
 timeout. Inspection is skipped when either setting is disabled. The public
 address fields show the fixture addresses; a missing family would be reported,
 and the proposal would remove the fixture's previously applied directive for
-that family. A timeout or inspection failure leaves Proposed blank with an
+that family. A timeout or inspection failure leaves Proposed unavailable with an
 error instead of presenting fixture data as a result.
 
 The default enabled page returns its header, theme control, provider simulation
@@ -144,21 +144,21 @@ snapshot came from.
 
 ```rust
 use std::future::Future;
-use topcoat_spf::{SpfAddresses, Availability, DiscoveredAddresses};
+use topcoat_spf::{DomainName, SpfAddresses, Availability, DiscoveredAddresses};
 
 pub trait SpfDns: Send + Sync {
     type Error: std::fmt::Display + Send + Sync + 'static;
-    fn txt_records(&self, name: &str)
+    fn txt_records(&self, name: &DomainName)
         -> impl Future<Output = Result<Vec<String>, Self::Error>> + Send;
-    fn replace_txt_records(&self, name: &str, records: &[String])
+    fn replace_txt_records(&self, name: &DomainName, records: &[String])
         -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 pub trait SpfAddressStore: Send + Sync {
     type Error: std::fmt::Display + Send + Sync + 'static;
-    fn load(&self, domain: &str)
+    fn load(&self, domain: &DomainName)
         -> impl Future<Output = Result<SpfAddresses, Self::Error>> + Send;
-    fn save(&self, domain: &str, addresses: &SpfAddresses)
+    fn save(&self, domain: &DomainName, addresses: &SpfAddresses)
         -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -192,7 +192,7 @@ unchanged. Use `SpfAddresses::replaced_with` to build the next value; the old
 ## Inspect and apply
 
 ```rust,no_run
-use topcoat_spf::{InspectRequest, SpfError, apply, inspect};
+use topcoat_spf::{DomainName, InspectRequest, SpfError, apply, inspect};
 
 async fn example<D, A, S, P>(
     dns: &D,
@@ -206,24 +206,24 @@ where
     S: topcoat_spf::SpfAddressStore,
     P: topcoat_spf::WritePolicy,
 {
+    let domain = DomainName::new("example.com").expect("configured hostname");
     let snapshot = inspect(
         dns,
         discovery,
         store,
         policy,
-        &InspectRequest::new("example.com", "Cloudflare"),
+        &InspectRequest::new(domain.clone(), "Cloudflare"),
     )
     .await;
 
-    let result = apply(dns, store, discovery, policy, "example.com").await?;
+    let result = apply(dns, store, discovery, policy, &domain).await?;
     Ok(())
 }
 ```
 
 `inspect` is resilient: DNS, discovery, storage and policy failures are
-collected into `Snapshot::error`, while known values still render. Both
-`inspect` and `apply` trim surrounding whitespace from the domain; hosts must
-still validate it. `apply` returns a typed `SpfError` and performs this
+collected into `Snapshot::error`, while known values still render. `DomainName` validates and canonicalizes names before service calls; hosts
+still own authorization. `apply` returns a typed `SpfError` and performs this
 sequence:
 
 1. Check the settings-backed `WritePolicy`.
@@ -542,3 +542,45 @@ rendering are not covered by automated tests; the crate and its tests use
 fixtures only.
 `topcoat dev` is a long-running server, so it is not part of the automated
 checks; run `topcoat dev` and open <http://127.0.0.1:3000/> for a manual check.
+
+## Validated API migration
+
+* Construct domains with `DomainName::new`, `str::parse`, or `TryFrom`.
+  Construction trims outer whitespace, lowercases ASCII and removes one final
+  root dot. Empty names, empty/oversized labels, invalid hostname characters,
+  leading/trailing label hyphens and names longer than 253 bytes produce
+  `DomainNameError`. Unicode must first be converted to IDNA A-labels by the
+  host; no implicit IDNA conversion or DNS lookup occurs. Single-label names
+  are accepted.
+* `InspectRequest::new` takes an owned `DomainName`; `Snapshot.domain` is typed.
+  `apply`, `SpfDns` and `SpfAddressStore` take `&DomainName`.
+  `MemorySpfAddressStore::with_initial` and `snapshot` use `DomainName` keys.
+  Persist `domain.as_str()` as the canonical key, scoped by the host's tenant.
+  Existing databases must canonicalize and reconcile equivalent legacy keys
+  (for example `Example.COM.` and `example.com`) before migration.
+* `Rewrite.desired`, `ApplyResult.desired_record` and rewrite helper results
+  are `SpfRecordText`. Construction and current rewrite input share strict
+  mechanism/CIDR checks before the SPF parser; unknown mechanisms are rejected,
+  while syntactically valid extension modifiers are preserved. Original text
+  is retained. This does not prove sender authorization, DNS
+  resolution or SPF evaluation limits. String boundaries can use `as_str()`,
+  `AsRef<str>`, `Display` or `into_string()` on either text type.
+* `Snapshot.desired` is `Option<SpfRecordText>`: `None` replaces the empty-string
+  sentinel when discovery, parsing or multiple SPF records prevent a proposal.
+  Multiple records retain the first raw SPF display but disable the proposal
+  and `needs_update`. `Snapshot` no longer
+  implements `Default`, since there is no valid default domain. The UI displays
+  an unavailable proposal and disables Publish for `None`.
+* `UsablePublicAddresses::new` requires at least one address and rejects any
+  supplied family excluded by the existing IP policy. Its private fields have
+  `ipv4()`/`ipv6()` accessors; `TryFrom<DiscoveredAddresses>` is also available.
+  `desired_spf_record_checked` and `replace_txt_records_checked` accept this
+  type. Option-based helpers remain filtering wrappers: like service discovery,
+  they drop unusable families and reject an empty result. Documentation ranges
+  remain accepted; the IP policy is unchanged.
+
+Raw DNS TXT RRsets remain `Vec<String>` and `Snapshot.current` remains
+`Option<String>`, including malformed SPF text used for diagnostics. Rewrite
+term spelling/order and unrelated TXT values remain preserved. Validated values
+do not grant authorization: hosts still authenticate, authorize, scope storage
+by tenant, serialize per-domain updates and protect write endpoints.

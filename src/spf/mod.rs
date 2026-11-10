@@ -6,21 +6,14 @@
 //! did not provide is not added, so its previously managed directive is removed.
 
 use crate::{SpfAddresses, SpfError};
-use mail_auth::{
-    dns::TxtRecordParser,
-    spf::{Mechanism, Qualifier, SpfRecord},
-};
+use mail_auth::spf::{Mechanism, Qualifier};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// The planned TXT RRset and the desired SPF value inside it.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Rewrite {
-    /// All TXT values to publish, preserving unrelated records and appending
-    /// the desired SPF record last.
-    pub records: Vec<String>,
-    /// The desired SPF record.
-    pub desired: String,
-}
+mod rewrite;
+mod syntax;
+pub(crate) use syntax::parse as parse_record;
+
+pub use rewrite::Rewrite;
 
 /// Whether a TXT value is an SPF record (`v=spf1`, case-insensitive).
 pub fn is_spf(record: &str) -> bool {
@@ -126,16 +119,24 @@ pub fn desired_spf_record(
     public_ipv4: Option<Ipv4Addr>,
     public_ipv6: Option<Ipv6Addr>,
     applied: &SpfAddresses,
-) -> Result<String, SpfError> {
-    let public_ipv4 = public_ipv4.filter(|ip| is_public_ipv4(*ip));
-    let public_ipv6 = public_ipv6.filter(|ip| is_public_ipv6(*ip));
-    if public_ipv4.is_none() && public_ipv6.is_none() {
-        return Err(SpfError::NoPublicAddress);
-    }
+) -> Result<crate::SpfRecordText, SpfError> {
+    let addresses = crate::UsablePublicAddresses::new(
+        public_ipv4.filter(|ip| is_public_ipv4(*ip)),
+        public_ipv6.filter(|ip| is_public_ipv6(*ip)),
+    )?;
+    desired_spf_record_checked(current_record, addresses, applied)
+}
+
+/// Rewrite with a validated, nonempty set of usable addresses.
+pub fn desired_spf_record_checked(
+    current_record: Option<&str>,
+    addresses: crate::UsablePublicAddresses,
+    applied: &SpfAddresses,
+) -> Result<crate::SpfRecordText, SpfError> {
+    let public_ipv4 = addresses.ipv4();
+    let public_ipv6 = addresses.ipv6();
     let current_text = current_record.unwrap_or("v=spf1 ~all");
-    let current = SpfRecord::parse(current_text.as_bytes()).map_err(|error| {
-        SpfError::InvalidRecord(format!("Could not parse the SPF record: {error}"))
-    })?;
+    let current = parse_record(current_text)?;
 
     // Keep the original term spelling and modifier order while using mail-auth's
     // typed parse to identify exact managed IP directives.
@@ -143,7 +144,7 @@ pub fn desired_spf_record(
     let directive_terms: Vec<_> = raw_terms
         .iter()
         .enumerate()
-        .filter(|(_, term)| !term.contains('='))
+        .filter(|(_, term)| !syntax::is_modifier(term))
         .collect();
     if directive_terms.len() != current.directives.len() {
         return Err(SpfError::InvalidRecord(
@@ -185,7 +186,7 @@ pub fn desired_spf_record(
 
     let mut directive_index = 0;
     for (term_index, term) in raw_terms.iter().enumerate() {
-        if term.contains('=') {
+        if syntax::is_modifier(term) {
             retained_terms.push((*term).to_string());
             continue;
         }
@@ -198,10 +199,12 @@ pub fn desired_spf_record(
         }
     }
 
-    Ok(std::iter::once("v=spf1".to_string())
-        .chain(retained_terms)
-        .collect::<Vec<_>>()
-        .join(" "))
+    crate::SpfRecordText::new(
+        std::iter::once("v=spf1".to_string())
+            .chain(retained_terms)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// Replace the SPF value in a TXT RRset, preserving every unrelated value.
@@ -218,6 +221,22 @@ pub fn replace_txt_records(
     ipv6: Option<Ipv6Addr>,
     applied: &SpfAddresses,
 ) -> Result<Rewrite, SpfError> {
+    if records.iter().filter(|record| is_spf(record)).count() > 1 {
+        return Err(SpfError::MultipleSpfRecords);
+    }
+    let addresses = crate::UsablePublicAddresses::new(
+        ipv4.filter(|ip| is_public_ipv4(*ip)),
+        ipv6.filter(|ip| is_public_ipv6(*ip)),
+    )?;
+    replace_txt_records_checked(records, addresses, applied)
+}
+
+/// Plan a complete TXT RRset using validated usable addresses.
+pub fn replace_txt_records_checked(
+    records: &[String],
+    addresses: crate::UsablePublicAddresses,
+    applied: &SpfAddresses,
+) -> Result<Rewrite, SpfError> {
     let spf: Vec<&str> = records
         .iter()
         .filter(|record| is_spf(record))
@@ -226,13 +245,13 @@ pub fn replace_txt_records(
     if spf.len() > 1 {
         return Err(SpfError::MultipleSpfRecords);
     }
-    let desired = desired_spf_record(spf.first().copied(), ipv4, ipv6, applied)?;
+    let desired = desired_spf_record_checked(spf.first().copied(), addresses, applied)?;
     let mut rewritten: Vec<String> = records
         .iter()
         .filter(|record| !is_spf(record))
         .cloned()
         .collect();
-    rewritten.push(desired.clone());
+    rewritten.push(desired.to_string());
     Ok(Rewrite {
         records: rewritten,
         desired,

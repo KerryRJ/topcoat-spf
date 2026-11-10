@@ -9,6 +9,8 @@
 /// include credentials.
 #[derive(Debug, thiserror::Error)]
 pub enum SpfError {
+    #[error("A supplied address is excluded by the public IP policy.")]
+    InvalidPublicAddress,
     /// The existing or proposed SPF record could not be parsed or mapped.
     #[error("{0}")]
     InvalidRecord(String),
