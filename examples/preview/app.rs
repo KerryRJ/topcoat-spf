@@ -37,8 +37,12 @@
 //! cargo run --example preview --features preview
 //! ```
 //!
-//! and open <http://127.0.0.1:3000/>.
+//! and open the configured listener: `127.0.0.1:3000` by default, or the
+//! `HOST`/`PORT` values from the nearest `.env`.
 
+use std::{env, fs, io};
+
+use tokio::net::TcpListener;
 use topcoat::{
     Result,
     context::Cx,
@@ -601,11 +605,166 @@ fn router() -> Router {
         .build()
 }
 
-/// Serves the static preview on the configured `HOST` and `PORT`.
+/// Default listener when neither the environment nor `.env` sets one.
+const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 3000;
+
+/// Listener settings file, searched for from the working directory upwards.
+const ENV_FILE: &str = ".env";
+
+/// Marker `topcoat dev` sets on the application process it starts.
+const DEV_MARKER: &str = "TOPCOAT_DEV_URL";
+
+/// The resolved preview listener.
+#[derive(Debug, PartialEq, Eq)]
+struct ListenerSettings {
+    host: String,
+    port: u16,
+}
+
+/// Serves the static preview on the configured host and port.
+///
+/// Process `HOST`/`PORT` values win, then the nearest `.env`, then
+/// `127.0.0.1:3000`. `topcoat dev` cannot read `.env`: it resolves its own
+/// `HOST`/`PORT` and injects them into this process. A value equal to its
+/// built-in default is therefore treated as "not overridden" so the `.env`
+/// listener still applies; any other value is an intentional override.
+///
+/// `topcoat::start` only reads the process environment, so the resolved
+/// listener is bound here and passed to `topcoat::serve`, which still reports
+/// readiness to `topcoat dev`.
 pub async fn run() {
-    topcoat::start(router())
-        .await
-        .expect("serve the topcoat-spf preview");
+    let settings = match listener_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("topcoat-spf preview: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    let listener = match TcpListener::bind((settings.host.as_str(), settings.port)).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!(
+                "topcoat-spf preview: cannot bind {}:{}: {error}. \
+                 Set HOST/PORT or update {ENV_FILE}.",
+                settings.host, settings.port
+            );
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(error) = topcoat::serve(listener, router()).await {
+        eprintln!("topcoat-spf preview: server error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn listener_settings() -> Result<ListenerSettings, io::Error> {
+    resolve_listener(
+        env::var_os(DEV_MARKER).is_some(),
+        env_value("HOST")?,
+        env_value("PORT")?,
+        dotenv_value("HOST"),
+        dotenv_value("PORT"),
+    )
+}
+
+/// Resolves the listener from process values, `.env` values and defaults.
+fn resolve_listener(
+    under_dev: bool,
+    process_host: Option<String>,
+    process_port: Option<String>,
+    dotenv_host: Option<String>,
+    dotenv_port: Option<String>,
+) -> Result<ListenerSettings, io::Error> {
+    let host = select_listener_value(DEFAULT_HOST, under_dev, process_host, dotenv_host);
+    let port = select_listener_value(
+        &DEFAULT_PORT.to_string(),
+        under_dev,
+        process_port,
+        dotenv_port,
+    );
+
+    Ok(ListenerSettings {
+        host,
+        port: parse_port("PORT", &port)?,
+    })
+}
+
+/// Chooses one listener value.
+///
+/// A process value wins unless it is exactly the default that `topcoat dev`
+/// injects when the user set nothing. In that case `.env` decides, because the
+/// launcher itself never reads `.env`.
+fn select_listener_value(
+    default: &str,
+    under_dev: bool,
+    process_value: Option<String>,
+    dotenv_value: Option<String>,
+) -> String {
+    match process_value {
+        Some(value) if !under_dev || value != default => value,
+        _ => dotenv_value.unwrap_or_else(|| default.to_owned()),
+    }
+}
+
+fn env_value(name: &str) -> Result<Option<String>, io::Error> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be valid Unicode: {error}"),
+        )),
+    }
+}
+
+fn parse_port(name: &str, value: &str) -> Result<u16, io::Error> {
+    value.parse().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be a valid port number: {error}"),
+        )
+    })
+}
+
+/// Reads one entry from the nearest `.env`, if the file exists.
+fn dotenv_value(name: &str) -> Option<String> {
+    let mut dir = env::current_dir().ok()?;
+
+    loop {
+        if let Ok(contents) = fs::read_to_string(dir.join(ENV_FILE)) {
+            return parse_dotenv(&contents, name);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn parse_dotenv(contents: &str, name: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == name).then(|| unquote(value.trim()).to_owned())
+    })
+}
+
+fn unquote(value: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    value
 }
 
 #[cfg(test)]
@@ -817,5 +976,122 @@ mod tests {
         assert!(fragment_body.contains("data-spf-panel=\"\""));
         assert!(fragment_body.contains("Enable to refresh or publish"));
         assert!(!fragment_body.contains("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn dotenv_entries_ignore_comments_and_trim_values() {
+        let contents = "# listener\nHOST = 0.0.0.0\nPORT=8080\n";
+        assert_eq!(parse_dotenv(contents, "HOST").as_deref(), Some("0.0.0.0"));
+        assert_eq!(parse_dotenv(contents, "PORT").as_deref(), Some("8080"));
+        assert_eq!(parse_dotenv(contents, "MISSING"), None);
+    }
+
+    #[test]
+    fn dotenv_values_accept_matching_quotes() {
+        assert_eq!(
+            parse_dotenv("HOST=\"0.0.0.0\"\n", "HOST").as_deref(),
+            Some("0.0.0.0")
+        );
+        assert_eq!(
+            parse_dotenv("HOST='127.0.0.1'\n", "HOST").as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn dotenv_values_handle_crlf_line_endings() {
+        assert_eq!(
+            parse_dotenv("HOST=127.0.0.1\r\nPORT=13003\r\n", "PORT").as_deref(),
+            Some("13003")
+        );
+    }
+
+    #[test]
+    fn listener_defaults_when_nothing_is_configured() {
+        assert_eq!(
+            resolve_listener(false, None, None, None, None).unwrap(),
+            ListenerSettings {
+                host: "127.0.0.1".to_owned(),
+                port: 3000,
+            }
+        );
+    }
+
+    #[test]
+    fn process_values_override_dotenv_outside_dev() {
+        assert_eq!(
+            resolve_listener(
+                false,
+                Some("0.0.0.0".to_owned()),
+                Some("8080".to_owned()),
+                Some("127.0.0.1".to_owned()),
+                Some("13003".to_owned()),
+            )
+            .unwrap(),
+            ListenerSettings {
+                host: "0.0.0.0".to_owned(),
+                port: 8080,
+            }
+        );
+    }
+
+    #[test]
+    fn dotenv_values_fill_in_missing_process_values() {
+        assert_eq!(
+            resolve_listener(
+                false,
+                None,
+                None,
+                Some("0.0.0.0".to_owned()),
+                Some("13003".to_owned()),
+            )
+            .unwrap(),
+            ListenerSettings {
+                host: "0.0.0.0".to_owned(),
+                port: 13003,
+            }
+        );
+    }
+
+    #[test]
+    fn dev_defaults_let_dotenv_choose_the_listener() {
+        assert_eq!(
+            resolve_listener(
+                true,
+                Some("127.0.0.1".to_owned()),
+                Some("3000".to_owned()),
+                Some("0.0.0.0".to_owned()),
+                Some("13003".to_owned()),
+            )
+            .unwrap(),
+            ListenerSettings {
+                host: "0.0.0.0".to_owned(),
+                port: 13003,
+            }
+        );
+    }
+
+    #[test]
+    fn dev_non_default_overrides_win_over_dotenv() {
+        assert_eq!(
+            resolve_listener(
+                true,
+                Some("0.0.0.0".to_owned()),
+                Some("8080".to_owned()),
+                Some("127.0.0.1".to_owned()),
+                Some("13003".to_owned()),
+            )
+            .unwrap(),
+            ListenerSettings {
+                host: "0.0.0.0".to_owned(),
+                port: 8080,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_ports_are_rejected() {
+        assert!(resolve_listener(false, None, Some("nope".to_owned()), None, None).is_err());
+        assert!(resolve_listener(false, None, None, None, Some("70000".to_owned())).is_err());
     }
 }

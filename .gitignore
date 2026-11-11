@@ -1,1 +1,3 @@
+# Local listener settings; use .env.example as a template.
+/.env
 /target/

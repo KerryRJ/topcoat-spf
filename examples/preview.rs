@@ -9,7 +9,8 @@
 //! cargo run --example preview --features preview
 //! ```
 //!
-//! and open <http://127.0.0.1:3000/>.
+//! and open the configured listener: `127.0.0.1:3000` by default, or the
+//! `HOST`/`PORT` values from the nearest `.env`.
 
 #[path = "preview/app.rs"]
 mod app;

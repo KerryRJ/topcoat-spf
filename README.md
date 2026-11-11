@@ -95,13 +95,34 @@ topcoat dev
 ```
 
 `topcoat dev` builds the `preview` binary with the package's default features,
-serves it, and rebuilds it when the preview source changes. Open
-<http://127.0.0.1:3000/>. Override the bind address with `HOST` and `PORT` if
-needed:
+serves it, and rebuilds it when the preview source changes. Open the configured
+listener: `127.0.0.1:3000` by default, or the `HOST`/`PORT` from the nearest
+`.env`.
+
+The preview listener defaults to `127.0.0.1:3000`. Copy `.env.example` to
+`.env` to set `HOST` and `PORT`; the preview reads the nearest `.env` from its
+working directory upwards. Process environment values win, with one exception:
+`topcoat dev` always injects its own resolved `HOST`/`PORT` (defaulting to
+`127.0.0.1:3000`) because it does not read `.env`. A value equal to that default
+is treated as "not overridden", so the `.env` listener applies. Any other
+`HOST`/`PORT` value still overrides:
 
 ```sh
 HOST=0.0.0.0 PORT=8080 topcoat dev
 ```
+
+If the launcher deliberately chooses a different non-default port (for example
+after finding the requested one in use), that choice wins over `.env`. To make
+the launcher's own probe and output reflect `.env`, export it first:
+
+```sh
+set -a; . ./.env; set +a; topcoat dev
+```
+
+On Windows a port can be unavailable with `WSAEACCES` (10013) even when nothing
+appears to be listening. `topcoat dev` only retries on `AddrInUse`, so if it
+injects a blocked default, choose a free `PORT` in `.env`. The preview now
+reports a failed bind with the address and error instead of panicking.
 
 The example remains available and runs the same app:
 
